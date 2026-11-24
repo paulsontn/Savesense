@@ -1,5 +1,6 @@
 from html import unescape
 import re
+import os
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 from fastapi import Depends, FastAPI, HTTPException
@@ -10,16 +11,19 @@ from sqlalchemy.orm import Session, selectinload
 from .database import Base, engine, get_db
 from .models import Category, EntrySection, KnowledgeEntry, Resource, Subcategory, Tag
 from .schemas import CategoryOut, EntryInput, EntryOut
-
 Base.metadata.create_all(bind=engine)
 app = FastAPI(title="SaveSense API")
+
+allowed_origins = ["http://localhost:5173", "http://127.0.0.1:5173"]
+if os.getenv("FRONTEND_URL"):
+    allowed_origins.append(os.getenv("FRONTEND_URL").strip().rstrip("/"))
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=allowed_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 class MetaRequest(BaseModel):
     url: str
 
