@@ -72,3 +72,40 @@
 .related-card:hover{border-color:#9fc9ad;background:#eef7f0}
 .related-card span{display:block;font-size:10px;font-weight:800;text-transform:uppercase;color:#23734d;margin-bottom:3px}
 .related-card strong{display:block;font-size:13px;line-height:1.35}
+
+/* Mobile Layout Polish */
+html, body {
+  overflow-x: hidden;
+  max-width: 100%;
+}
+
+@media (max-width: 900px) {
+  .shell {
+    display: block !important;
+    width: 100%;
+  }
+  aside {
+    display: none !important;
+  }
+  main {
+    width: 100%;
+    max-width: 100%;
+    padding: 18px 14px 48px;
+  }
+  .mobile-nav {
+    width: 100%;
+    -webkit-overflow-scrolling: touch;
+  }
+}
+
+@media (max-width: 600px) {
+  header {
+    align-items: flex-start;
+  }
+  .dup-warning,
+  .url-fetch-row {
+    grid-template-columns: 1fr;
+    flex-direction: column;
+    align-items: stretch;
+  }
+}
