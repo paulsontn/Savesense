@@ -1,19 +1,33 @@
+"""
+SaveSense FastAPI Backend
+Provides CRUD endpoints for knowledge entries, categories, URL metadata scraping,
+and AI-powered entry drafting and Q&A via Google Gemini / Groq / Ollama.
+"""
+
 from html import unescape
-import re
 import os
+import re
+
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
+
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session, selectinload
+
+from .ai_helper import answer_knowledge_query, generate_entry_draft
 from .database import Base, engine, get_db
 from .models import Category, EntrySection, KnowledgeEntry, Resource, Subcategory, Tag
 from .schemas import CategoryOut, EntryInput, EntryOut
+
+# Initialize SQLite database tables
 Base.metadata.create_all(bind=engine)
+
 app = FastAPI(title="SaveSense API")
 
+# Configure CORS for local development and deployed frontend origin
 allowed_origins = ["http://localhost:5173", "http://127.0.0.1:5173"]
 if os.getenv("FRONTEND_URL"):
     allowed_origins.append(os.getenv("FRONTEND_URL").strip().rstrip("/"))
@@ -24,10 +38,24 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
 class MetaRequest(BaseModel):
     url: str
 
-def entry_out(e: KnowledgeEntry):
+
+class AIDraftRequest(BaseModel):
+    title: str = ""
+    url: str = ""
+    notes: str = ""
+
+
+class AIAskRequest(BaseModel):
+    question: str
+
+
+def entry_out(e: KnowledgeEntry) -> dict:
+    """Serialize a KnowledgeEntry ORM model into the API response shape."""
     return {
         "id": e.id,
         "title": e.title,
@@ -48,7 +76,9 @@ def entry_out(e: KnowledgeEntry):
         "created_at": e.created_at,
     }
 
-def get_or_create_category(db: Session, name: str):
+
+def get_or_create_category(db: Session, name: str) -> Category:
+    """Fetch an existing category by name or create a new one."""
     clean = name.strip()
     category = db.scalar(select(Category).where(Category.name == clean))
     if not category:
@@ -57,7 +87,9 @@ def get_or_create_category(db: Session, name: str):
         db.flush()
     return category
 
-def get_or_create_subcategory(db: Session, category: Category, name: str | None):
+
+def get_or_create_subcategory(db: Session, category: Category, name: str | None) -> Subcategory | None:
+    """Fetch an existing subcategory within a category or create a new one."""
     if not name or not name.strip():
         return None
     clean = name.strip()
@@ -70,12 +102,60 @@ def get_or_create_subcategory(db: Session, category: Category, name: str | None)
         db.flush()
     return sub
 
+
 @app.get("/health")
 def health():
+    """Health check endpoint for Render uptime monitoring."""
     return {"status": "ok"}
+
+
+@app.post("/ai/draft")
+def ai_draft_entry(payload: AIDraftRequest, db: Session = Depends(get_db)):
+    """Generate a structured category, summary, tags, and takeaways using Gemini AI."""
+    categories = [c.name for c in db.scalars(select(Category).order_by(Category.name)).all()]
+    try:
+        draft = generate_entry_draft(
+            title=payload.title,
+            url=payload.url,
+            notes=payload.notes,
+            existing_categories=categories,
+        )
+        return {"provider": "gemini", **draft}
+    except Exception as exc:
+        raise HTTPException(503, str(exc))
+
+
+@app.post("/ai/ask")
+def ai_ask_knowledge(payload: AIAskRequest, db: Session = Depends(get_db)):
+    """Answer a natural language question grounded in saved SaveSense entries."""
+    question = payload.question.strip()
+    if not question:
+        raise HTTPException(400, "Question cannot be empty")
+    stmt = (
+        select(KnowledgeEntry)
+        .options(selectinload(KnowledgeEntry.category))
+        .order_by(KnowledgeEntry.created_at.desc())
+    )
+    items = [
+        {
+            "title": e.title,
+            "category": e.category.name if e.category else "General",
+            "summary": e.summary,
+            "notes": e.notes,
+            "url": e.source_url,
+        }
+        for e in db.scalars(stmt).all()
+    ]
+    try:
+        answer = answer_knowledge_query(question=question, entries=items)
+        return {"answer": answer}
+    except Exception as exc:
+        raise HTTPException(503, str(exc))
+
 
 @app.post("/fetch-meta")
 def fetch_url_metadata(payload: MetaRequest):
+    """Scrape OpenGraph/HTML title, description, and platform source from a URL."""
     url = payload.url.strip()
     if not url.startswith(("http://", "https://")):
         raise HTTPException(400, "URL must start with http:// or https://")
@@ -94,9 +174,15 @@ def fetch_url_metadata(payload: MetaRequest):
         with urlopen(req, timeout=6) as resp:
             html = resp.read(250_000).decode("utf-8", errors="ignore")
 
-        og_title = re.search(r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\'](.*?)["\']', html, re.I | re.S)
+        og_title = re.search(
+            r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\'](.*?)["\']', html, re.I | re.S
+        )
         tag_title = re.search(r"<title[^>]*>(.*?)</title>", html, re.I | re.S)
-        og_desc = re.search(r'<meta[^>]+(?:name|property)=["\'](?:og:description|description)["\'][^>]+content=["\'](.*?)["\']', html, re.I | re.S)
+        og_desc = re.search(
+            r'<meta[^>]+(?:name|property)=["\'](?:og:description|description)["\'][^>]+content=["\'](.*?)["\']',
+            html,
+            re.I | re.S,
+        )
 
         raw_title = (og_title.group(1) if og_title else (tag_title.group(1) if tag_title else "")).strip()
         raw_desc = (og_desc.group(1) if og_desc else "").strip()
@@ -108,12 +194,16 @@ def fetch_url_metadata(payload: MetaRequest):
     except Exception:
         return {"title": "", "summary": "", "source": source}
 
+
 @app.get("/categories", response_model=list[CategoryOut])
 def categories(db: Session = Depends(get_db)):
+    """Return all categories ordered alphabetically."""
     return db.scalars(select(Category).order_by(Category.name)).all()
+
 
 @app.get("/entries", response_model=list[EntryOut])
 def list_entries(q: str = "", category: str = "", db: Session = Depends(get_db)):
+    """List knowledge entries with optional keyword search and category filter."""
     stmt = (
         select(KnowledgeEntry)
         .options(
@@ -136,8 +226,10 @@ def list_entries(q: str = "", category: str = "", db: Session = Depends(get_db))
         stmt = stmt.join(KnowledgeEntry.category).where(Category.name == category)
     return [entry_out(e) for e in db.scalars(stmt).unique().all()]
 
+
 @app.post("/entries", response_model=EntryOut, status_code=201)
 def create_entry(data: EntryInput, db: Session = Depends(get_db)):
+    """Create a new knowledge entry along with sections, resources, and tags."""
     c = get_or_create_category(db, data.category)
     subcategory = get_or_create_subcategory(db, c, data.subcategory)
     e = KnowledgeEntry(
@@ -159,8 +251,10 @@ def create_entry(data: EntryInput, db: Session = Depends(get_db)):
     db.refresh(e)
     return entry_out(e)
 
+
 @app.put("/entries/{entry_id}", response_model=EntryOut)
 def update_entry(entry_id: int, data: EntryInput, db: Session = Depends(get_db)):
+    """Update an existing knowledge entry and replace its nested sections, resources, and tags."""
     e = db.get(KnowledgeEntry, entry_id)
     if not e:
         raise HTTPException(404, "Entry not found")
@@ -180,8 +274,10 @@ def update_entry(entry_id: int, data: EntryInput, db: Session = Depends(get_db))
     db.refresh(e)
     return entry_out(e)
 
+
 @app.patch("/entries/{entry_id}/favorite", response_model=EntryOut)
 def toggle_favorite(entry_id: int, db: Session = Depends(get_db)):
+    """Toggle the favorite status on a knowledge entry."""
     e = db.get(KnowledgeEntry, entry_id)
     if not e:
         raise HTTPException(404, "Entry not found")
@@ -190,8 +286,10 @@ def toggle_favorite(entry_id: int, db: Session = Depends(get_db)):
     db.refresh(e)
     return entry_out(e)
 
+
 @app.delete("/entries/{entry_id}", status_code=204)
 def delete_entry(entry_id: int, db: Session = Depends(get_db)):
+    """Delete a knowledge entry by ID."""
     e = db.get(KnowledgeEntry, entry_id)
     if not e:
         raise HTTPException(404, "Entry not found")
