@@ -51,8 +51,13 @@ def call_free_ai(prompt: str, expect_json: bool = False) -> str:
 
     # 1. Google Gemini Free Tier (Google AI Studio)
     if gemini_key:
-        model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={gemini_key}"
+        custom_model = os.getenv("GEMINI_MODEL", "").strip()
+        candidate_models = [custom_model] if custom_model else [
+            "gemini-2.5-flash",
+            "gemini-2.0-flash",
+            "gemini-2.0-flash-lite",
+            "gemini-1.5-flash",
+        ]
         gen_config: Dict[str, Any] = {"temperature": 0.4}
         if expect_json:
             gen_config["responseMimeType"] = "application/json"
@@ -61,11 +66,22 @@ def call_free_ai(prompt: str, expect_json: bool = False) -> str:
             "contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": gen_config,
         }
-        try:
-            res = _post_json(url, payload, headers={})
-            return res["candidates"][0]["content"]["parts"][0]["text"].strip()
-        except Exception as exc:
-            raise RuntimeError(f"Gemini API error: {exc}") from exc
+        last_err: Exception | None = None
+        for model in candidate_models:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={gemini_key}"
+            try:
+                res = _post_json(url, payload, headers={})
+                return res["candidates"][0]["content"]["parts"][0]["text"].strip()
+            except urllib.error.HTTPError as exc:
+                err_body = exc.read().decode("utf-8", errors="ignore")
+                last_err = RuntimeError(f"Gemini ({model}) HTTP {exc.code}: {err_body}")
+                if exc.code == 404:
+                    continue
+                raise last_err from exc
+            except Exception as exc:
+                last_err = exc
+                continue
+        raise RuntimeError(f"Gemini API error: {last_err}")
 
     # 2. Groq Free Tier
     if groq_key:
