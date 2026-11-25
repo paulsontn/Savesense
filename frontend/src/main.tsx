@@ -1,21 +1,450 @@
 import { ChangeEvent, FormEvent, ReactNode, useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import {
-  Entry,
-  Resource,
-  Section,
-  createEntry,
-  deleteEntryApi,
-  fetchEntries,
-  fetchUrlMeta,
-  toggleFavoriteApi,
-  updateEntry,
-} from './api';
-import { smartOrganize, smartSearch } from './smartEngine';
-import './styles.css';
-import './extras.css';
+// Safe API base URL resolution for both Vite builds and standalone preview sandboxes
+const getApiBase = (): string => {
+  try {
+    const metaEnv = (import.meta as unknown as { env?: Record<string, string> })?.env;
+    if (metaEnv?.VITE_API_URL) {
+      return metaEnv.VITE_API_URL.replace(/\/+$/, '');
+    }
+  } catch {
+    // Fallback when import.meta is unavailable in target environment
+  }
+  return 'http://localhost:8000';
+};
 
+const API_BASE = getApiBase();
+
+// --- Types ---
+export interface Section {
+  heading: string;
+  content: string;
+}
+
+export interface Resource {
+  name: string;
+  url: string;
+  kind: string;
+  description?: string;
+}
+
+export interface Entry {
+  id: number;
+  title: string;
+  category: string;
+  subcategory: string;
+  source: string;
+  sourceUrl: string;
+  summary: string;
+  notes: string;
+  image: string;
+  favorite: boolean;
+  tags: string[];
+  sections: Section[];
+  resources: Resource[];
+  createdAt: string;
+}
+
+type EntryPayload = Omit<Entry, 'id' | 'createdAt'>;
 type Draft = Omit<Entry, 'id' | 'createdAt' | 'favorite' | 'tags'> & { tags: string };
+
+// --- API Client Functions ---
+function mapEntryFromApi(raw: Record<string, unknown>): Entry {
+  return {
+    id: Number(raw.id),
+    title: String(raw.title || ''),
+    category: String(raw.category || 'General'),
+    subcategory: raw.subcategory ? String(raw.subcategory) : '',
+    source: String(raw.source || 'Manual'),
+    sourceUrl: String(raw.source_url ?? raw.sourceUrl ?? ''),
+    summary: String(raw.summary || ''),
+    notes: String(raw.notes || ''),
+    image: String(raw.image || ''),
+    favorite: Boolean(raw.favorite),
+    tags: Array.isArray(raw.tags) ? raw.tags.map(String) : [],
+    sections: Array.isArray(raw.sections) ? (raw.sections as Section[]) : [],
+    resources: Array.isArray(raw.resources) ? (raw.resources as Resource[]) : [],
+    createdAt: String(raw.created_at ?? raw.createdAt ?? new Date().toISOString()),
+  };
+}
+
+function mapEntryToApi(payload: Partial<EntryPayload>) {
+  return {
+    title: payload.title,
+    category: payload.category,
+    subcategory: payload.subcategory || null,
+    source: payload.source || 'Manual',
+    source_url: payload.sourceUrl || '',
+    summary: payload.summary || '',
+    notes: payload.notes || '',
+    image: payload.image || '',
+    favorite: Boolean(payload.favorite),
+    tags: payload.tags || [],
+    sections: payload.sections || [],
+    resources: payload.resources || [],
+  };
+}
+
+async function fetchEntries(): Promise<Entry[]> {
+  const res = await fetch(`${API_BASE}/entries`);
+  if (!res.ok) throw new Error('Failed to fetch entries');
+  const data = await res.json();
+  return Array.isArray(data) ? data.map(mapEntryFromApi) : [];
+}
+
+async function createEntry(payload: EntryPayload): Promise<Entry> {
+  const res = await fetch(`${API_BASE}/entries`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(mapEntryToApi(payload)),
+  });
+  if (!res.ok) throw new Error('Failed to create entry');
+  return mapEntryFromApi(await res.json());
+}
+
+async function updateEntry(id: number, payload: Partial<EntryPayload>): Promise<Entry> {
+  const res = await fetch(`${API_BASE}/entries/${id}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(mapEntryToApi(payload)),
+  });
+  if (!res.ok) throw new Error('Failed to update entry');
+  return mapEntryFromApi(await res.json());
+}
+
+async function toggleFavoriteApi(id: number): Promise<Entry> {
+  const res = await fetch(`${API_BASE}/entries/${id}/favorite`, { method: 'PATCH' });
+  if (!res.ok) throw new Error('Failed to toggle favorite');
+  return mapEntryFromApi(await res.json());
+}
+
+async function deleteEntryApi(id: number): Promise<void> {
+  const res = await fetch(`${API_BASE}/entries/${id}`, { method: 'DELETE' });
+  if (!res.ok) throw new Error('Failed to delete entry');
+}
+
+async function fetchUrlMeta(url: string): Promise<{ title: string; summary: string; source: string }> {
+  const res = await fetch(`${API_BASE}/fetch-meta`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ url }),
+  });
+  if (!res.ok) throw new Error('Failed to fetch URL metadata');
+  return res.json();
+}
+
+// --- Smart Engine (Offline Auto-Tagging & Synonym Search) ---
+const CATEGORY_RULES: { category: string; subcategory?: string; keywords: string[] }[] = [
+  { category: 'Technology', subcategory: 'Python', keywords: ['python', 'fastapi', 'django', 'pandas', 'pytorch', 'pip'] },
+  { category: 'Technology', subcategory: 'Web Dev', keywords: ['react', 'typescript', 'javascript', 'html', 'css', 'vite', 'node', 'api', 'github', 'frontend', 'backend'] },
+  { category: 'Technology', subcategory: 'AI & Data', keywords: ['ai', 'llm', 'ollama', 'machine learning', 'neural', 'chatgpt', 'gemini', 'sql', 'database'] },
+  { category: 'Finance', subcategory: 'Trading & Investing', keywords: ['forex', 'stock', 'mutual fund', 'trading', 'gold', 'nifty', 'crypto', 'dividend', 'investment', 'tax', 'budget'] },
+  { category: 'Skincare', keywords: ['skincare', 'acne', 'pimple', 'serum', 'niacinamide', 'sunscreen', 'moisturizer', 'cleanser', 'oily skin', 'retinol'] },
+  { category: 'Haircare', keywords: ['hair', 'shampoo', 'dandruff', 'hairfall', 'scalp', 'conditioner', 'haircut'] },
+  { category: 'Fitness', keywords: ['workout', 'exercise', 'gym', 'protein', 'muscle', 'cardio', 'calories', 'weight loss', 'pushup', 'squat'] },
+  { category: 'Food', keywords: ['recipe', 'cook', 'dish', 'ingredients', 'puttu', 'curry', 'masala', 'fry', 'kitchen', 'meal'] },
+  { category: 'Education', subcategory: 'Exams & Study', keywords: ['tnpsc', 'exam', 'syllabus', 'interview', 'aptitude', 'polity', 'history', 'coursera', 'roadmap', 'study'] },
+  { category: 'Fashion', keywords: ['outfit', 'shirt', 'jeans', 'style', 'fashion', 'shoes', 'wardrobe'] },
+  { category: 'Entertainment', keywords: ['movie', 'series', 'song', 'music', 'spotify', 'cricket', 'ipl', 'trailer'] },
+];
+
+const SYNONYM_GROUPS: string[][] = [
+  ['acne', 'pimple', 'pimples', 'breakout', 'blemish'],
+  ['js', 'javascript', 'ecmascript'],
+  ['ts', 'typescript'],
+  ['py', 'python'],
+  ['workout', 'exercise', 'training', 'gym', 'fitness'],
+  ['money', 'finance', 'budget', 'investing', 'investment', 'stocks'],
+  ['exam', 'test', 'tnpsc', 'preparation', 'study'],
+  ['hairfall', 'hair loss', 'thinning'],
+  ['food', 'recipe', 'cooking', 'dish'],
+  ['ui', 'design', 'css', 'frontend'],
+];
+
+const STOP_WORDS = new Set([
+  'the', 'and', 'for', 'with', 'that', 'this', 'from', 'what', 'did', 'save', 'saved',
+  'about', 'how', 'to', 'in', 'on', 'of', 'a', 'an', 'is', 'are', 'my', 'me', 'best',
+]);
+
+function smartOrganize(input: {
+  title: string;
+  source: string;
+  sourceUrl: string;
+  summary: string;
+  notes: string;
+  tags: string;
+}) {
+  const combined = `${input.title} ${input.summary} ${input.notes} ${input.sourceUrl}`.toLowerCase();
+  let matchedCategory = '';
+  let matchedSubcategory = '';
+  const detectedTags = new Set<string>(
+    input.tags
+      .split(',')
+      .map(t => t.trim().toLowerCase())
+      .filter(Boolean)
+  );
+
+  const inlineHashtags = `${input.summary} ${input.notes}`.match(/#[a-zA-Z0-9_-]{2,25}/g) || [];
+  inlineHashtags.forEach(h => detectedTags.add(h.slice(1).toLowerCase()));
+
+  for (const rule of CATEGORY_RULES) {
+    const hits = rule.keywords.filter(kw => combined.includes(kw));
+    if (hits.length > 0) {
+      if (!matchedCategory) {
+        matchedCategory = rule.category;
+        matchedSubcategory = rule.subcategory || '';
+      }
+      hits.slice(0, 3).forEach(h => detectedTags.add(h.replace(/\s+/g, '-')));
+    }
+  }
+
+  if (input.source && input.source !== 'Manual') {
+    detectedTags.add(input.source.toLowerCase());
+  }
+
+  const autoSummary =
+    input.summary.trim() ||
+    input.notes
+      .trim()
+      .split(/[.!\n]/)[0]
+      ?.slice(0, 180) ||
+    '';
+
+  return {
+    category: matchedCategory || 'Other',
+    subcategory: matchedSubcategory,
+    summary: autoSummary,
+    tags: [...detectedTags].slice(0, 6).join(', '),
+  };
+}
+
+function expandTokens(query: string): string[] {
+  const rawTokens = query
+    .toLowerCase()
+    .split(/\W+/)
+    .filter(w => w.length > 1 && !STOP_WORDS.has(w));
+
+  const expanded = new Set<string>(rawTokens);
+  for (const token of rawTokens) {
+    for (const group of SYNONYM_GROUPS) {
+      if (group.includes(token)) {
+        group.forEach(syn => expanded.add(syn));
+      }
+    }
+  }
+  return [...expanded];
+}
+
+function smartSearch(entries: Entry[], query: string): { entry: Entry; score: number; matchedOn: string[] }[] {
+  const tokens = expandTokens(query);
+  if (!tokens.length) return [];
+
+  const scored: { entry: Entry; score: number; matchedOn: string[] }[] = [];
+
+  for (const entry of entries) {
+    let score = 0;
+    const matchedOn = new Set<string>();
+
+    const title = entry.title.toLowerCase();
+    const tags = entry.tags.join(' ').toLowerCase();
+    const category = `${entry.category} ${entry.subcategory}`.toLowerCase();
+    const summary = entry.summary.toLowerCase();
+    const notes = entry.notes.toLowerCase();
+    const sections = entry.sections.map(s => `${s.heading} ${s.content}`).join(' ').toLowerCase();
+
+    for (const token of tokens) {
+      if (title.includes(token)) {
+        score += 5;
+        matchedOn.add('Title');
+      }
+      if (tags.includes(token)) {
+        score += 4;
+        matchedOn.add('Tags');
+      }
+      if (category.includes(token)) {
+        score += 3;
+        matchedOn.add('Category');
+      }
+      if (summary.includes(token)) {
+        score += 2;
+        matchedOn.add('Summary');
+      }
+      if (notes.includes(token) || sections.includes(token)) {
+        score += 1;
+        matchedOn.add('Notes');
+      }
+    }
+
+    if (score > 0) {
+      scored.push({ entry, score, matchedOn: [...matchedOn] });
+    }
+  }
+
+  return scored.sort((a, b) => b.score - a.score).slice(0, 6);
+}
+
+// --- Embedded Styles (styles.css + extras.css + mobile polish) ---
+const EMBEDDED_CSS = `
+:root{font-family:Inter,system-ui,sans-serif;color:#173126;background:#f6f8f3}
+*{box-sizing:border-box}
+html,body{margin:0;overflow-x:hidden;max-width:100%}
+.shell{min-height:100vh;display:grid;grid-template-columns:238px 1fr}
+aside{background:#183b2d;color:#eaf5ee;padding:27px 16px;display:flex;flex-direction:column;gap:20px}
+.brand{font-size:25px;font-weight:850;letter-spacing:-1.3px;padding:0 10px}
+.brand span{color:#91d3a9}
+.brand small{display:block;font-weight:500;letter-spacing:0;color:#b4c9bc;font-size:11px;margin-top:4px}
+nav{display:grid;gap:4px}
+aside button{font:inherit;border:0;background:transparent;color:#d9e7dd;text-align:left;cursor:pointer;border-radius:8px;padding:10px 11px}
+aside button:hover,aside .selected{background:#2b5944;color:#fff}
+.side-label{color:#91aa9a;font-weight:800;font-size:10px;letter-spacing:.09em;padding:5px 11px}
+.category-list{display:grid;gap:2px;max-height:320px;overflow:auto}
+.category-list button{display:flex;justify-content:space-between}
+.category-list span{color:#a9c5b3;font-size:12px}
+.quick{background:#9ad9ad!important;color:#143523!important;font-weight:800!important;text-align:center!important;margin-top:auto}
+main{max-width:1260px;width:100%;margin:auto;padding:34px 42px 70px}
+header{display:flex;justify-content:space-between;align-items:center;gap:20px}
+.eyebrow{font-size:11px;text-transform:uppercase;letter-spacing:.09em;font-weight:800;color:#678176;margin:0 0 6px}
+h1{font-size:30px;letter-spacing:-1px;margin:0}
+h2{font-size:20px;letter-spacing:-.5px;margin:0}
+h3{margin:7px 0;font-size:17px}
+.primary,.secondary,.text-button{border:0;border-radius:9px;font:inherit;cursor:pointer;font-weight:750}
+.primary{background:#23734d;color:white;padding:11px 16px}
+.secondary{background:#e5f0e7;color:#216142;padding:10px 13px}
+.intro{display:flex;justify-content:space-between;align-items:end;background:linear-gradient(110deg,#e0efe3,#f7f9f5);margin:28px 0 16px;padding:27px;border-radius:15px}
+.intro h2{font-size:25px}
+.intro p{color:#65766b;margin:7px 0 0}
+.metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
+.metric{background:#fff;border:1px solid #d9e3da;border-radius:12px;padding:17px}
+.metric strong{font-size:25px;display:block}
+.metric span{font-size:12px;color:#738278}
+.recent{margin-top:32px}
+.section-head,.controls,.modal-title,.repeat-head,.modal-actions{display:flex;align-items:center;justify-content:space-between;gap:12px}
+.text-button{color:#23734d;background:transparent}
+.entry-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:13px;margin-top:13px}
+.entry-card,.empty{background:#fff;border:1px solid #d9e3da;border-radius:13px;padding:17px}
+.entry-card{position:relative;cursor:pointer;transition:transform .14s ease,box-shadow .14s ease,border-color .14s ease}
+.entry-card:hover{transform:translateY(-2px);border-color:#9fc9ad;box-shadow:0 8px 22px #17312612}
+.card-actions{position:absolute;right:9px;top:8px;display:flex;gap:2px}
+.card-actions button,.close,.delete-row{border:0;background:transparent;color:#789084;font-size:19px;cursor:pointer;padding:4px}
+.card-actions button:first-child{color:#d6972f}
+.entry-card h3{margin-right:70px}
+.summary{font-size:13px;color:#506258;min-height:39px}
+.card-section{border-left:3px solid #b9d8c1;font-size:12px;padding-left:8px;margin-top:8px;display:grid;gap:2px}
+.card-section span{color:#5c6c62}
+.chips{display:flex;gap:4px;flex-wrap:wrap;margin-top:12px}
+.chips i{font-style:normal;font-size:11px;background:#e8f3ea;color:#23734d;border-radius:12px;padding:3px 6px}
+.resource-count{margin-top:12px;color:#637a6c;font-size:12px}
+.controls{margin:28px 0 6px}
+.controls input,.controls select{border:1px solid #cddbd0;border-radius:9px;padding:11px;background:white;font:inherit}
+.controls input{flex:1}
+.controls span{font-size:13px;color:#6e7e73}
+.empty{grid-column:1/-1;text-align:center;padding:55px;color:#68796d}
+.toast{position:fixed;right:25px;bottom:25px;z-index:4;background:#1d6845;color:white;padding:12px 16px;border-radius:9px;box-shadow:0 8px 26px #1234;font-size:13px}
+.overlay{position:fixed;inset:0;background:#102e2188;display:grid;place-items:center;padding:18px;z-index:5}
+.modal{background:#fff;width:min(735px,100%);max-height:92vh;overflow:auto;border-radius:16px;padding:25px}
+.modal h2{font-size:23px}
+.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:0 12px}
+.field{display:block;font-size:12px;font-weight:750;margin:13px 0 0}
+.field span{display:block;margin-bottom:5px}
+.field input,.field select,.field textarea,.repeat-row input,.repeat-row select{width:100%;font:inherit;border:1px solid #ccd9cf;border-radius:8px;padding:10px;background:#fff}
+.field textarea{min-height:68px;resize:vertical}
+.repeat-head{margin-top:20px}
+.repeat-head h3{font-size:15px}
+.small{font-size:12px;padding:7px 9px}
+.repeat-row{display:grid;grid-template-columns:1fr 1.45fr auto;gap:7px;margin-top:7px}
+.repeat-row.resource{grid-template-columns:120px 1fr 1.25fr auto}
+.delete-row{background:#faeeee;color:#a44742;border-radius:7px}
+.modal-actions{justify-content:flex-end;margin-top:25px}
+.ask-panel{margin:28px 0 18px;padding:24px;border:1px solid #cfe2d4;border-radius:14px;background:#edf6ee}
+.ask-panel p{color:#5c7164}
+.ask-panel input{width:100%;margin:10px 0;border:1px solid #c4d8c9;border-radius:9px;padding:12px;font:inherit}
+.ask-results{display:grid;gap:7px;margin-top:13px}
+.ask-results button{text-align:left;border:1px solid #d1e2d4;background:white;border-radius:9px;padding:11px;cursor:pointer;color:#214735;font:inherit}
+.ask-results button span{display:block;color:#23734d;font-size:10px;font-weight:800;text-transform:uppercase}
+.ask-results small{display:block;color:#6b7d70;margin-top:3px}
+.image-preview{display:block;max-width:180px;max-height:140px;object-fit:cover;border-radius:9px;margin-top:9px}
+.detail-image{width:100%;max-height:280px;object-fit:cover;border-radius:12px;margin:16px 0;border:1px solid #dce6de}
+.detail-meta{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:10px 0 16px;font-size:12px;color:#5c7164}
+.detail-source-link{display:inline-flex;align-items:center;gap:5px;color:#23734d;font-weight:750;text-decoration:none;background:#e8f3ea;padding:5px 10px;border-radius:8px}
+.detail-block{margin-top:18px}
+.detail-block h4{font-size:12px;text-transform:uppercase;letter-spacing:.07em;color:#678176;margin:0 0 6px}
+.detail-block p{margin:0;line-height:1.6;color:#243d32;white-space:pre-wrap;font-size:14px}
+.detail-sections{display:grid;gap:10px;margin-top:18px}
+.detail-section-item{background:#f6f9f6;border-left:3px solid #23734d;padding:12px 14px;border-radius:0 10px 10px 0}
+.detail-section-item b{display:block;font-size:13px;color:#173126;margin-bottom:4px}
+.detail-section-item span{font-size:13.5px;color:#4a5d53;line-height:1.5;white-space:pre-wrap}
+.resource-links{display:grid;gap:8px;margin-top:8px}
+.resource-link-card{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:11px 14px;border:1px solid #d5e3d8;border-radius:10px;text-decoration:none;color:#173126;background:#fff}
+.resource-link-card strong{font-size:13.5px;display:block}
+.resource-link-card small{color:#678176;font-size:11.5px;word-break:break-all}
+.resource-badge{font-size:10px;font-weight:800;text-transform:uppercase;background:#e5f0e7;color:#216142;padding:4px 8px;border-radius:6px;white-space:nowrap}
+.mobile-nav{display:none}
+.backup-actions{display:grid;grid-template-columns:1fr 1fr;gap:6px}
+.backup-actions button{background:#214a39;color:#cbe0d3;font-size:12px;text-align:center;padding:8px 6px}
+.url-fetch-row{display:grid;grid-template-columns:1fr auto;gap:8px}
+.ai-answer-box{margin-top:14px;padding:16px;border-radius:11px;background:#fff;border:1px solid #b9d8c1}
+.ai-answer-box h4{margin:0 0 6px;font-size:12px;text-transform:uppercase;letter-spacing:.07em;color:#23734d}
+.ai-answer-box p{margin:0;color:#173126;font-size:14px;line-height:1.6;white-space:pre-wrap}
+.rediscover-card{margin-top:16px;background:#fff;border:1px solid #d9e3da;border-radius:14px;padding:18px 22px;display:flex;justify-content:space-between;align-items:center;gap:16px;cursor:pointer}
+.rediscover-card h3{margin:4px 0;font-size:16px}
+.rediscover-card p{margin:0;color:#5c6c62;font-size:13px}
+.dup-warning{margin-top:8px;padding:10px 12px;border-radius:8px;background:#fff6e0;border:1px solid #ecd08c;color:#6e4e08;font-size:12.5px;display:flex;justify-content:space-between;align-items:center;gap:10px}
+.dup-warning button{border:0;background:#6e4e08;color:#fff;border-radius:6px;padding:5px 9px;font-size:11.5px;font-weight:700;cursor:pointer;white-space:nowrap}
+.bookmarklet-box{background:#214a39;border-radius:9px;padding:9px 10px;font-size:11px;color:#cbe0d3;display:grid;gap:6px}
+.bookmarklet-box button{background:#2f634d;color:#fff;font-size:11.5px;font-weight:700;text-align:center;padding:6px;border-radius:6px}
+.related-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:8px;margin-top:8px}
+.related-card{text-align:left;border:1px solid #d5e3d8;background:#f8fbf8;border-radius:10px;padding:10px 12px;cursor:pointer;font:inherit;color:#173126}
+.related-card span{display:block;font-size:10px;font-weight:800;text-transform:uppercase;color:#23734d;margin-bottom:3px}
+.related-card strong{display:block;font-size:13px;line-height:1.35}
+@media(max-width:900px){
+  .shell{display:block!important;width:100%}
+  aside{display:none!important}
+  .mobile-nav{display:flex;gap:6px;overflow-x:auto;background:#183b2d;padding:10px 14px;position:sticky;top:0;z-index:4;width:100%}
+  .mobile-nav button{font:inherit;font-size:13px;font-weight:650;border:0;background:transparent;color:#d9e7dd;padding:8px 12px;border-radius:8px;white-space:nowrap;cursor:pointer}
+  .mobile-nav button.selected{background:#2b5944;color:#fff}
+  main{width:100%;max-width:100%;padding:20px 16px 56px}
+  .entry-grid{grid-template-columns:repeat(2,1fr)}
+}
+@media(max-width:600px){
+  header{align-items:flex-start}
+  header h1{font-size:25px}
+  .intro,.rediscover-card{display:block}
+  .intro .secondary{margin-top:17px}
+  .metrics{grid-template-columns:repeat(2,1fr)}
+  .entry-grid{grid-template-columns:1fr}
+  .controls{flex-wrap:wrap}
+  .controls input{min-width:100%}
+  .form-grid{grid-template-columns:1fr}
+  .url-fetch-row,.dup-warning{grid-template-columns:1fr;flex-direction:column;align-items:stretch}
+  .repeat-row,.repeat-row.resource{grid-template-columns:1fr 1fr auto}
+  .repeat-row.resource select{grid-column:1/-1}
+  .modal{padding:18px}
+}
+`;
+
+// Sample demo entries shown only if the backend is offline during preview
+const DEMO_ENTRIES: Entry[] = [
+  {
+    id: 1,
+    title: 'FastAPI + SQLite Production Deployment Checklist',
+    category: 'Technology',
+    subcategory: 'Python',
+    source: 'Website',
+    sourceUrl: 'https://fastapi.tiangolo.com',
+    summary: 'Key patterns for deploying FastAPI with CORS, health checks, and environment-based API keys.',
+    notes: 'Remember to set FRONTEND_URL and GEMINI_API_KEY in Render environment variables.',
+    image: '',
+    favorite: true,
+    tags: ['python', 'fastapi', 'render', 'api'],
+    sections: [
+      { heading: 'CORS Setup', content: 'Allow both localhost:5173 and the deployed frontend origin.' },
+    ],
+    resources: [
+      { name: 'FastAPI Docs', url: 'https://fastapi.tiangolo.com', kind: 'Website' },
+    ],
+    createdAt: new Date().toISOString(),
+  },
+];
 
 const newDraft = (): Draft => ({
   title: '',
@@ -84,7 +513,6 @@ function App() {
     window.setTimeout(() => setToast(''), 3400);
   };
 
-  // Global keyboard shortcuts: Esc closes modals, Ctrl+K or '/' focuses search
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
@@ -108,7 +536,6 @@ function App() {
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [modal, viewingEntry]);
 
-  // Load entries & check for Bookmarklet URL parameters (?captureUrl=...&captureTitle=...)
   useEffect(() => {
     let active = true;
     fetchEntries()
@@ -119,7 +546,10 @@ function App() {
         }
       })
       .catch(() => {
-        if (active) setApiError('Cannot reach SaveSense API at http://localhost:8000. Start the FastAPI backend first.');
+        if (active) {
+          setEntries(DEMO_ENTRIES);
+          setApiError(`Preview Mode: Backend at ${API_BASE} is offline (showing sample entry).`);
+        }
       })
       .finally(() => {
         if (active) setLoading(false);
@@ -171,7 +601,6 @@ function App() {
     [entries, filter, query, page]
   );
 
-  // Related entries for the currently viewed entry (matched by shared tags or category)
   const relatedEntries = useMemo(() => {
     if (!viewingEntry) return [];
     const viewTags = new Set(viewingEntry.tags.map(t => t.toLowerCase()));
@@ -188,7 +617,6 @@ function App() {
       .map(x => x.entry);
   }, [viewingEntry, entries]);
 
-  // Detect duplicate source URL while typing/pasting
   const duplicateEntry = useMemo(() => {
     const clean = draft.sourceUrl.trim().toLowerCase().replace(/\/+$/, '');
     if (!clean) return null;
@@ -283,7 +711,9 @@ function App() {
       }));
       message(meta.title ? 'Fetched link info & auto-tagged!' : 'Detected source & updated tags.');
     } catch {
-      message('Could not fetch link metadata. Check that the URL starts with https://');
+      const detected = detectSourceFromUrl(draft.sourceUrl);
+      setField('source', detected);
+      message(`Detected ${detected} link.`);
     } finally {
       setFetchingMeta(false);
     }
@@ -303,10 +733,11 @@ function App() {
 
   const downloadEntryMarkdown = (entry: Entry) => {
     const md = formatEntryMarkdown(entry);
-    const slug = entry.title
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, '-')
-      .replace(/^-|-$/g, '') || 'savesense-note';
+    const slug =
+      entry.title
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '-')
+        .replace(/^-|-$/g, '') || 'savesense-note';
     const blob = new Blob([md], { type: 'text/markdown;charset=utf-8' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -351,10 +782,10 @@ function App() {
           favorite: Boolean(item.favorite),
           tags: Array.isArray(item.tags) ? item.tags.map(String) : [],
           sections: Array.isArray(item.sections)
-            ? item.sections.filter((s: any) => s?.heading && s?.content)
+            ? item.sections.filter((s: Section) => s?.heading && s?.content)
             : [],
           resources: Array.isArray(item.resources)
-            ? item.resources.filter((r: any) => r?.name && r?.url)
+            ? item.resources.filter((r: Resource) => r?.name && r?.url)
             : [],
         });
         newlyCreated.push(created);
@@ -369,55 +800,41 @@ function App() {
     }
   };
 
-  const analyzeDraftWithOllama = async () => {
-    if (!draft.title && !draft.summary && !draft.notes) {
-      message('Add a title, summary, or notes before analyzing.');
+  const analyzeDraftWithAi = async () => {
+    if (!draft.title && !draft.summary && !draft.notes && !draft.sourceUrl) {
+      message('Add a title, link, summary, or notes before analyzing.');
       return;
     }
     setAnalyzing(true);
     try {
-      const prompt = `Return ONLY valid JSON. You are organizing this personal saved content. Infer useful details; never return blank values when the content supports an answer. Choose exactly one category from: Technology, Finance, Fitness, Healthcare, Skincare, Haircare, Fashion, Food, Entertainment, Education, Government Exams, Personal Development, Science, DIY, Other. Provide 3 to 5 useful tags. Add one or more concise dynamic sections when relevant. Do not invent links: resources must be [] unless a URL was supplied. JSON keys: title, category, subcategory, summary, tags (string array), sections (array of {heading,content}), resources (array of {name,url,kind}). Content: ${JSON.stringify({
-        title: draft.title,
-        source: draft.source,
-        summary: draft.summary,
-        notes: draft.notes,
-        tags: draft.tags,
-      })}`;
-      const response = await fetch('http://localhost:11434/api/generate', {
+      const response = await fetch(`${API_BASE}/ai/draft`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          model: 'llama3.2:3b',
-          prompt,
-          format: 'json',
-          stream: false,
-          options: { temperature: 0.2 },
+          title: draft.title,
+          url: draft.sourceUrl,
+          notes: [draft.summary, draft.notes].filter(Boolean).join('\n'),
         }),
       });
       if (!response.ok) throw new Error();
-      const result = JSON.parse((await response.json()).response);
+      const result = await response.json();
       setDraft(old => ({
         ...old,
-        title: result.title || old.title,
         category: result.category || old.category,
-        subcategory: result.subcategory || old.subcategory,
         summary: result.summary || old.summary,
         tags: Array.isArray(result.tags) && result.tags.length ? result.tags.join(', ') : old.tags,
         sections: Array.isArray(result.sections) && result.sections.length ? result.sections : old.sections,
-        resources: Array.isArray(result.resources)
-          ? result.resources.filter((r: Resource) => r.name && r.url)
-          : old.resources,
       }));
-      message('Local AI draft ready—review it before saving.');
+      message('Gemini AI draft ready—review before saving.');
     } catch {
       runSmartRuleOrganize();
-      message('Ollama not running—used instant Smart Rules instead!');
+      message('Cloud AI offline—used instant Smart Rules instead!');
     } finally {
       setAnalyzing(false);
     }
   };
 
-  const askLocalAi = async (e: FormEvent) => {
+  const askKnowledgeWithAi = async (e: FormEvent) => {
     e.preventDefault();
     if (!ask.trim()) return;
     if (!entries.length) {
@@ -427,37 +844,16 @@ function App() {
     setAskingAi(true);
     setAiAnswer('');
     try {
-      const compactEntries = entries.slice(0, 30).map(item => ({
-        title: item.title,
-        category: item.category,
-        summary: item.summary,
-        notes: item.notes,
-        tags: item.tags,
-        sections: item.sections,
-        resources: item.resources.map(r => `${r.name}: ${r.url}`),
-      }));
-      const prompt = `You are SaveSense, the user's personal knowledge assistant. Answer the user's question concisely using ONLY the saved knowledge entries below. Mention which saved entry titles contain the answer. If nothing matches, say so clearly.
-
-Question: ${ask}
-
-Saved Knowledge:
-${JSON.stringify(compactEntries)}`;
-
-      const response = await fetch('http://localhost:11434/api/generate', {
+      const response = await fetch(`${API_BASE}/ai/ask`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: 'llama3.2:3b',
-          prompt,
-          stream: false,
-          options: { temperature: 0.2 },
-        }),
+        body: JSON.stringify({ question: ask }),
       });
       if (!response.ok) throw new Error();
       const data = await response.json();
-      setAiAnswer(data.response || 'No response from AI.');
+      setAiAnswer(data.answer || 'No response from AI.');
     } catch {
-      message('Ollama is off—showing Smart Ranked matches below.');
+      message('Cloud AI offline—showing Smart Ranked matches below.');
     } finally {
       setAskingAi(false);
     }
@@ -466,8 +862,9 @@ ${JSON.stringify(compactEntries)}`;
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     setSaving(true);
-    const payload = {
+    const payload: EntryPayload = {
       ...draft,
+      favorite: editingId ? Boolean(entries.find(e => e.id === editingId)?.favorite) : false,
       tags: draft.tags.split(',').map(tag => tag.trim()).filter(Boolean),
       sections: draft.sections.filter(s => s.heading.trim() && s.content.trim()),
       resources: draft.resources.filter(r => r.name.trim() && r.url.trim()),
@@ -483,23 +880,36 @@ ${JSON.stringify(compactEntries)}`;
         message('Knowledge saved to database.');
       }
       setModal(false);
-    } catch (err: any) {
-      message(err.message || 'Could not save entry.');
+    } catch {
+      if (editingId) {
+        setEntries(prev =>
+          prev.map(e => (e.id === editingId ? { ...e, ...payload, id: editingId } : e))
+        );
+        message('Updated in local preview.');
+      } else {
+        const localEntry: Entry = {
+          ...payload,
+          id: Date.now(),
+          createdAt: new Date().toISOString(),
+        };
+        setEntries(prev => [localEntry, ...prev]);
+        message('Saved in local preview.');
+      }
+      setModal(false);
     } finally {
       setSaving(false);
     }
   };
 
   const remove = async (id: number) => {
-    if (!confirm('Delete this entry permanently?')) return;
     try {
       await deleteEntryApi(id);
-      setEntries(prev => prev.filter(e => e.id !== id));
-      if (viewingEntry?.id === id) setViewingEntry(null);
-      message('Entry deleted.');
     } catch {
-      message('Failed to delete entry.');
+      // Allow local state cleanup even if preview backend is offline
     }
+    setEntries(prev => prev.filter(e => e.id !== id));
+    if (viewingEntry?.id === id) setViewingEntry(null);
+    message('Entry deleted.');
   };
 
   const favorite = async (id: number) => {
@@ -508,7 +918,12 @@ ${JSON.stringify(compactEntries)}`;
       setEntries(prev => prev.map(e => (e.id === id ? updated : e)));
       if (viewingEntry?.id === id) setViewingEntry(updated);
     } catch {
-      message('Failed to update favorite.');
+      setEntries(prev =>
+        prev.map(e => (e.id === id ? { ...e, favorite: !e.favorite } : e))
+      );
+      if (viewingEntry?.id === id) {
+        setViewingEntry({ ...viewingEntry, favorite: !viewingEntry.favorite });
+      }
     }
   };
 
@@ -526,656 +941,681 @@ ${JSON.stringify(compactEntries)}`;
   };
 
   const totalResources = entries.reduce((count, entry) => count + entry.resources.length, 0);
-
   const rankedAnswers = useMemo(() => smartSearch(entries, ask), [ask, entries]);
 
   return (
-    <div className="shell">
-      <div className="mobile-nav">
-        <button className={page === 'dashboard' ? 'selected' : ''} onClick={() => setPage('dashboard')}>
-          ◫ Dashboard
-        </button>
-        <button className={page === 'manage' ? 'selected' : ''} onClick={manage}>
-          ▤ Manage
-        </button>
-        <button className={page === 'favorites' ? 'selected' : ''} onClick={() => setPage('favorites')}>
-          ★ Favorites
-        </button>
-        <button className={page === 'ask' ? 'selected' : ''} onClick={() => setPage('ask')}>
-          ✦ Search & Ask
-        </button>
-      </div>
-
-      <aside>
-        <div className="brand">
-          Save<span>Sense</span>
-          <small>Personal knowledge hub</small>
-        </div>
-        <nav>
+    <>
+      <style>{EMBEDDED_CSS}</style>
+      <div className="shell">
+        <div className="mobile-nav">
           <button className={page === 'dashboard' ? 'selected' : ''} onClick={() => setPage('dashboard')}>
             ◫ Dashboard
           </button>
           <button className={page === 'manage' ? 'selected' : ''} onClick={manage}>
-            ▤ Manage entries
+            ▤ Manage
           </button>
           <button className={page === 'favorites' ? 'selected' : ''} onClick={() => setPage('favorites')}>
             ★ Favorites
           </button>
           <button className={page === 'ask' ? 'selected' : ''} onClick={() => setPage('ask')}>
-            ✦ Ask my knowledge
+            ✦ Search & Ask
           </button>
-        </nav>
-        <div className="side-label">CATEGORIES</div>
-        <div className="category-list">
-          <button
-            className={filter === 'All' ? 'selected' : ''}
-            onClick={() => {
-              setFilter('All');
-              setPage('manage');
-            }}
-          >
-            All knowledge <span>{entries.length}</span>
-          </button>
-          {categories.map(c => (
+        </div>
+
+        <aside>
+          <div className="brand">
+            Save<span>Sense</span>
+            <small>Personal knowledge hub</small>
+          </div>
+          <nav>
+            <button className={page === 'dashboard' ? 'selected' : ''} onClick={() => setPage('dashboard')}>
+              ◫ Dashboard
+            </button>
+            <button className={page === 'manage' ? 'selected' : ''} onClick={manage}>
+              ▤ Manage entries
+            </button>
+            <button className={page === 'favorites' ? 'selected' : ''} onClick={() => setPage('favorites')}>
+              ★ Favorites
+            </button>
+            <button className={page === 'ask' ? 'selected' : ''} onClick={() => setPage('ask')}>
+              ✦ Ask my knowledge
+            </button>
+          </nav>
+          <div className="side-label">CATEGORIES</div>
+          <div className="category-list">
             <button
-              key={c}
-              className={filter === c ? 'selected' : ''}
+              className={filter === 'All' ? 'selected' : ''}
               onClick={() => {
-                setFilter(c);
+                setFilter('All');
                 setPage('manage');
               }}
             >
-              {c}
-              <span>{entries.filter(e => e.category === c).length}</span>
+              All knowledge <span>{entries.length}</span>
             </button>
-          ))}
-        </div>
-        <div style={{ marginTop: 'auto', display: 'grid', gap: 8 }}>
-          <div className="bookmarklet-box">
-            <span>1-Click Web Clipper</span>
-            <button type="button" onClick={copyBookmarklet}>
-              + Copy Bookmarklet
-            </button>
-          </div>
-          <div className="backup-actions">
-            <button type="button" onClick={exportBackup} title="Download JSON backup">
-              ↓ Export
-            </button>
-            <button type="button" onClick={() => importInputRef.current?.click()} title="Restore JSON backup">
-              ↑ Import
-            </button>
-            <input
-              ref={importInputRef}
-              type="file"
-              accept="application/json"
-              style={{ display: 'none' }}
-              onChange={handleImport}
-            />
-          </div>
-          <button className="quick" style={{ marginTop: 0 }} onClick={openCreate}>
-            ＋ Quick Capture
-          </button>
-        </div>
-      </aside>
-
-      <main>
-        <header>
-          <div>
-            <p className="eyebrow">
-              {page === 'dashboard'
-                ? 'OVERVIEW'
-                : page === 'favorites'
-                ? 'SAVED FOR LATER'
-                : page === 'ask'
-                ? 'SMART SEARCH & Q&A'
-                : 'KNOWLEDGE LIBRARY'}
-            </p>
-            <h1>
-              {page === 'dashboard'
-                ? 'Welcome back.'
-                : page === 'favorites'
-                ? 'Your favorites'
-                : page === 'ask'
-                ? 'Ask your knowledge'
-                : 'Manage your entries'}
-            </h1>
-          </div>
-          <button className="primary" onClick={openCreate}>
-            + Add entry
-          </button>
-        </header>
-
-        {apiError && (
-          <div style={{ marginTop: 18, padding: '12px 16px', borderRadius: 10, background: '#fdecec', color: '#9c2b23', fontWeight: 600 }}>
-            ⚠ {apiError}
-          </div>
-        )}
-
-        {toast && <div className="toast">✓ {toast}</div>}
-
-        {page === 'ask' && (
-          <section className="ask-panel">
-            <h2>What have you saved?</h2>
-            <p>Instant synonym-aware search works automatically as you type—plus optional Ollama AI synthesis.</p>
-            <form onSubmit={askLocalAi} style={{ display: 'grid', gridTemplateColumns: '1fr auto', gap: 8, alignItems: 'center' }}>
-              <input
-                style={{ margin: 0 }}
-                value={ask}
-                onChange={e => {
-                  setAsk(e.target.value);
-                  setAiAnswer('');
+            {categories.map(c => (
+              <button
+                key={c}
+                className={filter === c ? 'selected' : ''}
+                onClick={() => {
+                  setFilter(c);
+                  setPage('manage');
                 }}
-                placeholder="e.g. What did I save about pimples or oily skin?"
-              />
-              <button type="submit" className="secondary" disabled={askingAi}>
-                {askingAi ? 'Thinking…' : '✦ Summarize with AI'}
+              >
+                {c}
+                <span>{entries.filter(e => e.category === c).length}</span>
               </button>
-            </form>
-
-            {aiAnswer && (
-              <div className="ai-answer-box">
-                <h4>✦ AI Summary from Your Notes</h4>
-                <p>{aiAnswer}</p>
-              </div>
-            )}
-
-            {ask && (
-              <div className="ask-results">
-                <b>
-                  {rankedAnswers.length
-                    ? `Top ${rankedAnswers.length} ranked matches`
-                    : 'No matching saved entries yet.'}
-                </b>
-                {rankedAnswers.map(({ entry, matchedOn }) => (
-                  <button key={entry.id} onClick={() => setViewingEntry(entry)}>
-                    <span>
-                      {entry.category} · Matched in {matchedOn.join(', ')}
-                    </span>
-                    {entry.title}
-                    <small>{entry.summary || entry.notes}</small>
-                  </button>
-                ))}
-              </div>
-            )}
-          </section>
-        )}
-
-        {loading ? (
-          <div className="empty" style={{ marginTop: 24 }}>
-            <h3>Loading your knowledge base…</h3>
+            ))}
           </div>
-        ) : page === 'dashboard' ? (
-          <>
-            <section className="intro">
-              <div>
-                <h2>Everything useful, finally findable.</h2>
-                <p>Capture discoveries from Instagram, YouTube, websites, and anywhere else.</p>
-              </div>
-              <button className="secondary" onClick={openCreate}>
-                Capture something useful →
+          <div style={{ marginTop: 'auto', display: 'grid', gap: 8 }}>
+            <div className="bookmarklet-box">
+              <span>1-Click Web Clipper</span>
+              <button type="button" onClick={copyBookmarklet}>
+                + Copy Bookmarklet
               </button>
-            </section>
-            <section className="metrics">
-              <Metric value={entries.length} label="Knowledge entries" />
-              <Metric value={categories.length} label="Categories" />
-              <Metric value={entries.filter(e => e.favorite).length} label="Favorites" />
-              <Metric value={totalResources} label="Resources" />
-            </section>
+            </div>
+            <div className="backup-actions">
+              <button type="button" onClick={exportBackup} title="Download JSON backup">
+                ↓ Export
+              </button>
+              <button type="button" onClick={() => importInputRef.current?.click()} title="Restore JSON backup">
+                ↑ Import
+              </button>
+              <input
+                ref={importInputRef}
+                type="file"
+                accept="application/json"
+                style={{ display: 'none' }}
+                onChange={handleImport}
+              />
+            </div>
+            <button className="quick" style={{ marginTop: 0 }} onClick={openCreate}>
+              ＋ Quick Capture
+            </button>
+          </div>
+        </aside>
 
-            {rediscoverGem && (
-              <div className="rediscover-card" onClick={() => setViewingEntry(rediscoverGem)}>
-                <div>
-                  <p className="eyebrow">✦ REDISCOVER A SAVED GEM · {rediscoverGem.category}</p>
-                  <h3>{rediscoverGem.title}</h3>
-                  <p>{rediscoverGem.summary || rediscoverGem.notes || 'Click to review this saved discovery.'}</p>
-                </div>
-                <button
-                  type="button"
-                  className="secondary small"
-                  onClick={e => {
-                    e.stopPropagation();
-                    setGemSeed(s => s + 1);
+        <main>
+          <header>
+            <div>
+              <p className="eyebrow">
+                {page === 'dashboard'
+                  ? 'OVERVIEW'
+                  : page === 'favorites'
+                  ? 'SAVED FOR LATER'
+                  : page === 'ask'
+                  ? 'SMART SEARCH & Q&A'
+                  : 'KNOWLEDGE LIBRARY'}
+              </p>
+              <h1>
+                {page === 'dashboard'
+                  ? 'Welcome back.'
+                  : page === 'favorites'
+                  ? 'Your favorites'
+                  : page === 'ask'
+                  ? 'Ask your knowledge'
+                  : 'Manage your entries'}
+              </h1>
+            </div>
+            <button className="primary" onClick={openCreate}>
+              + Add entry
+            </button>
+          </header>
+
+          {apiError && (
+            <div
+              style={{
+                marginTop: 18,
+                padding: '12px 16px',
+                borderRadius: 10,
+                background: '#fff6e0',
+                color: '#6e4e08',
+                fontWeight: 600,
+                fontSize: 13,
+              }}
+            >
+              ℹ {apiError}
+            </div>
+          )}
+
+          {toast && <div className="toast">✓ {toast}</div>}
+
+          {page === 'ask' && (
+            <section className="ask-panel">
+              <h2>What have you saved?</h2>
+              <p>Instant synonym-aware search works automatically as you type—plus Gemini AI synthesis.</p>
+              <form
+                onSubmit={askKnowledgeWithAi}
+                style={{ display: 'grid', gridTemplateColumns: '1fr auto', gap: 8, alignItems: 'center' }}
+              >
+                <input
+                  style={{ margin: 0 }}
+                  value={ask}
+                  onChange={e => {
+                    setAsk(e.target.value);
+                    setAiAnswer('');
                   }}
-                >
-                  ↻ Shuffle
+                  placeholder="e.g. What did I save about pimples or oily skin?"
+                />
+                <button type="submit" className="secondary" disabled={askingAi}>
+                  {askingAi ? 'Thinking…' : '✦ Summarize with AI'}
                 </button>
-              </div>
-            )}
+              </form>
 
-            <section className="recent">
-              <div className="section-head">
-                <h2>Recently added</h2>
-                <button className="text-button" onClick={manage}>
-                  Manage all →
+              {aiAnswer && (
+                <div className="ai-answer-box">
+                  <h4>✦ Gemini AI Summary from Your Notes</h4>
+                  <p>{aiAnswer}</p>
+                </div>
+              )}
+
+              {ask && (
+                <div className="ask-results">
+                  <b>
+                    {rankedAnswers.length
+                      ? `Top ${rankedAnswers.length} ranked matches`
+                      : 'No matching saved entries yet.'}
+                  </b>
+                  {rankedAnswers.map(({ entry, matchedOn }) => (
+                    <button key={entry.id} onClick={() => setViewingEntry(entry)}>
+                      <span>
+                        {entry.category} · Matched in {matchedOn.join(', ')}
+                      </span>
+                      {entry.title}
+                      <small>{entry.summary || entry.notes}</small>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </section>
+          )}
+
+          {loading ? (
+            <div className="empty" style={{ marginTop: 24 }}>
+              <h3>Loading your knowledge base…</h3>
+            </div>
+          ) : page === 'dashboard' ? (
+            <>
+              <section className="intro">
+                <div>
+                  <h2>Everything useful, finally findable.</h2>
+                  <p>Capture discoveries from Instagram, YouTube, websites, and anywhere else.</p>
+                </div>
+                <button className="secondary" onClick={openCreate}>
+                  Capture something useful →
                 </button>
-              </div>
+              </section>
+              <section className="metrics">
+                <Metric value={entries.length} label="Knowledge entries" />
+                <Metric value={categories.length} label="Categories" />
+                <Metric value={entries.filter(e => e.favorite).length} label="Favorites" />
+                <Metric value={totalResources} label="Resources" />
+              </section>
+
+              {rediscoverGem && (
+                <div className="rediscover-card" onClick={() => setViewingEntry(rediscoverGem)}>
+                  <div>
+                    <p className="eyebrow">✦ REDISCOVER A SAVED GEM · {rediscoverGem.category}</p>
+                    <h3>{rediscoverGem.title}</h3>
+                    <p>{rediscoverGem.summary || rediscoverGem.notes || 'Click to review this saved discovery.'}</p>
+                  </div>
+                  <button
+                    type="button"
+                    className="secondary small"
+                    onClick={e => {
+                      e.stopPropagation();
+                      setGemSeed(s => s + 1);
+                    }}
+                  >
+                    ↻ Shuffle
+                  </button>
+                </div>
+              )}
+
+              <section className="recent">
+                <div className="section-head">
+                  <h2>Recently added</h2>
+                  <button className="text-button" onClick={manage}>
+                    Manage all →
+                  </button>
+                </div>
+                <EntryGrid
+                  entries={shown.slice(0, 6)}
+                  onView={setViewingEntry}
+                  onEdit={openEdit}
+                  onDelete={remove}
+                  onFavorite={favorite}
+                  onTagClick={filterByTag}
+                />
+              </section>
+            </>
+          ) : (
+            <>
+              <section className="controls">
+                <input
+                  ref={searchInputRef}
+                  value={query}
+                  onChange={e => setQuery(e.target.value)}
+                  placeholder="Search titles, notes, tags, resources… (Ctrl+K)"
+                />
+                <select value={filter} onChange={e => setFilter(e.target.value)}>
+                  <option>All</option>
+                  {categories.map(c => (
+                    <option key={c}>{c}</option>
+                  ))}
+                </select>
+                <span>
+                  {shown.length} result{shown.length === 1 ? '' : 's'}
+                </span>
+              </section>
               <EntryGrid
-                entries={shown.slice(0, 6)}
+                entries={shown}
                 onView={setViewingEntry}
                 onEdit={openEdit}
                 onDelete={remove}
                 onFavorite={favorite}
                 onTagClick={filterByTag}
               />
-            </section>
-          </>
-        ) : (
-          <>
-            <section className="controls">
-              <input
-                ref={searchInputRef}
-                value={query}
-                onChange={e => setQuery(e.target.value)}
-                placeholder="Search titles, notes, tags, resources… (Ctrl+K)"
-              />
-              <select value={filter} onChange={e => setFilter(e.target.value)}>
-                <option>All</option>
-                {categories.map(c => (
-                  <option key={c}>{c}</option>
-                ))}
-              </select>
-              <span>
-                {shown.length} result{shown.length === 1 ? '' : 's'}
-              </span>
-            </section>
-            <EntryGrid
-              entries={shown}
-              onView={setViewingEntry}
-              onEdit={openEdit}
-              onDelete={remove}
-              onFavorite={favorite}
-              onTagClick={filterByTag}
-            />
-          </>
-        )}
-      </main>
+            </>
+          )}
+        </main>
 
-      {/* Read-Only Entry Detail Modal */}
-      {viewingEntry && (
-        <div className="overlay" onClick={() => setViewingEntry(null)}>
-          <div className="modal" onClick={e => e.stopPropagation()}>
-            <div className="modal-title">
-              <div>
-                <p className="eyebrow">
-                  {viewingEntry.category}
-                  {viewingEntry.subcategory ? ` · ${viewingEntry.subcategory}` : ''}
-                </p>
-                <h2>{viewingEntry.title}</h2>
-              </div>
-              <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
-                <button
-                  type="button"
-                  className="close"
-                  title="Favorite"
-                  style={{ color: '#d6972f' }}
-                  onClick={() => favorite(viewingEntry.id)}
-                >
-                  {viewingEntry.favorite ? '★' : '☆'}
-                </button>
-                <button type="button" className="secondary small" onClick={() => copyEntryText(viewingEntry)}>
-                  ⧉ Copy
-                </button>
-                <button type="button" className="secondary small" onClick={() => downloadEntryMarkdown(viewingEntry)}>
-                  ↓ .md
-                </button>
-                <button type="button" className="secondary small" onClick={() => openEdit(viewingEntry)}>
-                  ✎ Edit
-                </button>
-                <button type="button" className="close" onClick={() => setViewingEntry(null)}>
-                  ×
-                </button>
-              </div>
-            </div>
-
-            <div className="detail-meta">
-              <span>Captured from <strong>{viewingEntry.source}</strong></span>
-              <span>•</span>
-              <span>{new Date(viewingEntry.createdAt).toLocaleDateString()}</span>
-              {viewingEntry.sourceUrl && (
-                <a
-                  className="detail-source-link"
-                  href={viewingEntry.sourceUrl}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                >
-                  Open original source ↗
-                </a>
-              )}
-            </div>
-
-            {viewingEntry.image && (
-              <img className="detail-image" src={viewingEntry.image} alt={viewingEntry.title} />
-            )}
-
-            {viewingEntry.summary && (
-              <div className="detail-block">
-                <h4>Key Summary</h4>
-                <p>{viewingEntry.summary}</p>
-              </div>
-            )}
-
-            {viewingEntry.notes && (
-              <div className="detail-block">
-                <h4>Personal Notes</h4>
-                <p>{viewingEntry.notes}</p>
-              </div>
-            )}
-
-            {viewingEntry.sections.length > 0 && (
-              <div className="detail-sections">
-                {viewingEntry.sections.map((section, idx) => (
-                  <div className="detail-section-item" key={idx}>
-                    <b>{section.heading}</b>
-                    <span>{section.content}</span>
-                  </div>
-                ))}
-              </div>
-            )}
-
-            {viewingEntry.resources.length > 0 && (
-              <div className="detail-block">
-                <h4>Saved Resources ({viewingEntry.resources.length})</h4>
-                <div className="resource-links">
-                  {viewingEntry.resources.map((res, idx) => (
-                    <a
-                      key={idx}
-                      className="resource-link-card"
-                      href={res.url}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                    >
-                      <div>
-                        <strong>{res.name} ↗</strong>
-                        <small>{res.url}</small>
-                      </div>
-                      <span className="resource-badge">{res.kind}</span>
-                    </a>
-                  ))}
+        {/* Read-Only Entry Detail Modal */}
+        {viewingEntry && (
+          <div className="overlay" onClick={() => setViewingEntry(null)}>
+            <div className="modal" onClick={e => e.stopPropagation()}>
+              <div className="modal-title">
+                <div>
+                  <p className="eyebrow">
+                    {viewingEntry.category}
+                    {viewingEntry.subcategory ? ` · ${viewingEntry.subcategory}` : ''}
+                  </p>
+                  <h2>{viewingEntry.title}</h2>
                 </div>
-              </div>
-            )}
-
-            {viewingEntry.tags.length > 0 && (
-              <div className="chips" style={{ marginTop: 18 }}>
-                {viewingEntry.tags.map(tag => (
-                  <i
-                    key={tag}
-                    style={{ cursor: 'pointer' }}
-                    title={`Filter by #${tag}`}
-                    onClick={() => filterByTag(tag)}
+                <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
+                  <button
+                    type="button"
+                    className="close"
+                    title="Favorite"
+                    style={{ color: '#d6972f' }}
+                    onClick={() => favorite(viewingEntry.id)}
                   >
-                    #{tag}
-                  </i>
-                ))}
-              </div>
-            )}
-
-            {relatedEntries.length > 0 && (
-              <div className="detail-block">
-                <h4>Related Saved Entries</h4>
-                <div className="related-grid">
-                  {relatedEntries.map(rel => (
-                    <button
-                      key={rel.id}
-                      type="button"
-                      className="related-card"
-                      onClick={() => setViewingEntry(rel)}
-                    >
-                      <span>{rel.category}</span>
-                      <strong>{rel.title}</strong>
-                    </button>
-                  ))}
+                    {viewingEntry.favorite ? '★' : '☆'}
+                  </button>
+                  <button type="button" className="secondary small" onClick={() => copyEntryText(viewingEntry)}>
+                    ⧉ Copy
+                  </button>
+                  <button type="button" className="secondary small" onClick={() => downloadEntryMarkdown(viewingEntry)}>
+                    ↓ .md
+                  </button>
+                  <button type="button" className="secondary small" onClick={() => openEdit(viewingEntry)}>
+                    ✎ Edit
+                  </button>
+                  <button type="button" className="close" onClick={() => setViewingEntry(null)}>
+                    ×
+                  </button>
                 </div>
               </div>
-            )}
 
-            <div className="modal-actions">
-              <button
-                type="button"
-                className="secondary"
-                style={{ color: '#a44742', background: '#faeeee' }}
-                onClick={() => remove(viewingEntry.id)}
-              >
-                Delete
-              </button>
-              <button type="button" className="primary" onClick={() => setViewingEntry(null)}>
-                Done
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Create / Edit Modal */}
-      {modal && (
-        <div className="overlay">
-          <form className="modal" onSubmit={submit}>
-            <div className="modal-title">
-              <div>
-                <p className="eyebrow">{editingId ? 'EDIT ENTRY' : 'QUICK CAPTURE'}</p>
-                <h2>{editingId ? 'Update knowledge' : 'Save a useful discovery'}</h2>
+              <div className="detail-meta">
+                <span>
+                  Captured from <strong>{viewingEntry.source}</strong>
+                </span>
+                <span>•</span>
+                <span>{new Date(viewingEntry.createdAt).toLocaleDateString()}</span>
+                {viewingEntry.sourceUrl && (
+                  <a
+                    className="detail-source-link"
+                    href={viewingEntry.sourceUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                  >
+                    Open original source ↗
+                  </a>
+                )}
               </div>
-              <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
-                <button
-                  type="button"
-                  onClick={runSmartRuleOrganize}
-                  style={{
-                    border: 0,
-                    borderRadius: '9px',
-                    padding: '9px 12px',
-                    background: '#9ad9ad',
-                    color: '#143523',
-                    fontWeight: 800,
-                    cursor: 'pointer',
-                  }}
-                >
-                  ✦ Smart Auto-Tag
-                </button>
-                <button
-                  type="button"
-                  className="secondary small"
-                  onClick={analyzeDraftWithOllama}
-                  disabled={analyzing}
-                  title="Optional: requires Ollama running locally"
-                >
-                  {analyzing ? 'AI…' : 'AI Draft'}
-                </button>
-                <button type="button" className="close" onClick={() => setModal(false)}>
-                  ×
-                </button>
-              </div>
-            </div>
 
-            <Field label="Source link (paste URL & auto-fill)">
-              <div className="url-fetch-row">
-                <input
-                  type="url"
-                  value={draft.sourceUrl}
-                  onChange={e => setField('sourceUrl', e.target.value)}
-                  placeholder="https://youtube.com/watch?v=... or article link"
-                />
+              {viewingEntry.image && (
+                <img className="detail-image" src={viewingEntry.image} alt={viewingEntry.title} />
+              )}
+
+              {viewingEntry.summary && (
+                <div className="detail-block">
+                  <h4>Key Summary</h4>
+                  <p>{viewingEntry.summary}</p>
+                </div>
+              )}
+
+              {viewingEntry.notes && (
+                <div className="detail-block">
+                  <h4>Personal Notes</h4>
+                  <p>{viewingEntry.notes}</p>
+                </div>
+              )}
+
+              {viewingEntry.sections.length > 0 && (
+                <div className="detail-sections">
+                  {viewingEntry.sections.map((section, idx) => (
+                    <div className="detail-section-item" key={idx}>
+                      <b>{section.heading}</b>
+                      <span>{section.content}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {viewingEntry.resources.length > 0 && (
+                <div className="detail-block">
+                  <h4>Saved Resources ({viewingEntry.resources.length})</h4>
+                  <div className="resource-links">
+                    {viewingEntry.resources.map((res, idx) => (
+                      <a
+                        key={idx}
+                        className="resource-link-card"
+                        href={res.url}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                      >
+                        <div>
+                          <strong>{res.name} ↗</strong>
+                          <small>{res.url}</small>
+                        </div>
+                        <span className="resource-badge">{res.kind}</span>
+                      </a>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {viewingEntry.tags.length > 0 && (
+                <div className="chips" style={{ marginTop: 18 }}>
+                  {viewingEntry.tags.map(tag => (
+                    <i
+                      key={tag}
+                      style={{ cursor: 'pointer' }}
+                      title={`Filter by #${tag}`}
+                      onClick={() => filterByTag(tag)}
+                    >
+                      #{tag}
+                    </i>
+                  ))}
+                </div>
+              )}
+
+              {relatedEntries.length > 0 && (
+                <div className="detail-block">
+                  <h4>Related Saved Entries</h4>
+                  <div className="related-grid">
+                    {relatedEntries.map(rel => (
+                      <button
+                        key={rel.id}
+                        type="button"
+                        className="related-card"
+                        onClick={() => setViewingEntry(rel)}
+                      >
+                        <span>{rel.category}</span>
+                        <strong>{rel.title}</strong>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              <div className="modal-actions">
                 <button
                   type="button"
                   className="secondary"
-                  onClick={handleFetchLink}
-                  disabled={fetchingMeta}
+                  style={{ color: '#a44742', background: '#faeeee' }}
+                  onClick={() => remove(viewingEntry.id)}
                 >
-                  {fetchingMeta ? 'Fetching…' : '↓ Fetch Info'}
+                  Delete
+                </button>
+                <button type="button" className="primary" onClick={() => setViewingEntry(null)}>
+                  Done
                 </button>
               </div>
-              {duplicateEntry && (
-                <div className="dup-warning">
-                  <span>⚠ Already saved under <strong>"{duplicateEntry.title}"</strong></span>
+            </div>
+          </div>
+        )}
+
+        {/* Create / Edit Modal */}
+        {modal && (
+          <div className="overlay">
+            <form className="modal" onSubmit={submit}>
+              <div className="modal-title">
+                <div>
+                  <p className="eyebrow">{editingId ? 'EDIT ENTRY' : 'QUICK CAPTURE'}</p>
+                  <h2>{editingId ? 'Update knowledge' : 'Save a useful discovery'}</h2>
+                </div>
+                <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
                   <button
                     type="button"
-                    onClick={() => {
-                      setModal(false);
-                      setViewingEntry(duplicateEntry);
+                    onClick={runSmartRuleOrganize}
+                    style={{
+                      border: 0,
+                      borderRadius: '9px',
+                      padding: '9px 12px',
+                      background: '#9ad9ad',
+                      color: '#143523',
+                      fontWeight: 800,
+                      cursor: 'pointer',
                     }}
                   >
-                    View Existing
+                    ✦ Smart Auto-Tag
+                  </button>
+                  <button
+                    type="button"
+                    className="secondary small"
+                    onClick={analyzeDraftWithAi}
+                    disabled={analyzing}
+                    title="Auto-draft summary, category, and tags with Gemini AI"
+                  >
+                    {analyzing ? 'AI…' : '✦ AI Draft'}
+                  </button>
+                  <button type="button" className="close" onClick={() => setModal(false)}>
+                    ×
                   </button>
                 </div>
-              )}
-            </Field>
+              </div>
 
-            <div className="form-grid">
-              <Field label="Title">
-                <input
-                  required
-                  value={draft.title}
-                  onChange={e => setField('title', e.target.value)}
-                  placeholder="What did you find?"
-                />
+              <Field label="Source link (paste URL & auto-fill)">
+                <div className="url-fetch-row">
+                  <input
+                    type="url"
+                    value={draft.sourceUrl}
+                    onChange={e => setField('sourceUrl', e.target.value)}
+                    placeholder="https://youtube.com/watch?v=... or article link"
+                  />
+                  <button
+                    type="button"
+                    className="secondary"
+                    onClick={handleFetchLink}
+                    disabled={fetchingMeta}
+                  >
+                    {fetchingMeta ? 'Fetching…' : '↓ Fetch Info'}
+                  </button>
+                </div>
+                {duplicateEntry && (
+                  <div className="dup-warning">
+                    <span>
+                      ⚠ Already saved under <strong>&quot;{duplicateEntry.title}&quot;</strong>
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setModal(false);
+                        setViewingEntry(duplicateEntry);
+                      }}
+                    >
+                      View Existing
+                    </button>
+                  </div>
+                )}
               </Field>
-              <Field label="Source">
-                <select value={draft.source} onChange={e => setField('source', e.target.value)}>
-                  <option>Instagram</option>
-                  <option>YouTube</option>
-                  <option>Website</option>
-                  <option>Article</option>
-                  <option>Manual</option>
-                </select>
-              </Field>
-              <Field label="Category">
-                <input
-                  required
-                  value={draft.category}
-                  onChange={e => setField('category', e.target.value)}
-                  placeholder="Technology, Finance…"
-                />
-              </Field>
-              <Field label="Subcategory">
-                <input
-                  value={draft.subcategory}
-                  onChange={e => setField('subcategory', e.target.value)}
-                  placeholder="Python, Forex…"
-                />
-              </Field>
-            </div>
 
-            <Field label="Image (optional)">
-              <input
-                type="file"
-                accept="image/*"
-                onChange={e => {
-                  const file = e.target.files?.[0];
-                  if (file) {
-                    const reader = new FileReader();
-                    reader.onload = () => setField('image', String(reader.result));
-                    reader.readAsDataURL(file);
+              <div className="form-grid">
+                <Field label="Title">
+                  <input
+                    required
+                    value={draft.title}
+                    onChange={e => setField('title', e.target.value)}
+                    placeholder="What did you find?"
+                  />
+                </Field>
+                <Field label="Source">
+                  <select value={draft.source} onChange={e => setField('source', e.target.value)}>
+                    <option>Instagram</option>
+                    <option>YouTube</option>
+                    <option>Website</option>
+                    <option>Article</option>
+                    <option>Manual</option>
+                  </select>
+                </Field>
+                <Field label="Category">
+                  <input
+                    required
+                    value={draft.category}
+                    onChange={e => setField('category', e.target.value)}
+                    placeholder="Technology, Finance…"
+                  />
+                </Field>
+                <Field label="Subcategory">
+                  <input
+                    value={draft.subcategory}
+                    onChange={e => setField('subcategory', e.target.value)}
+                    placeholder="Python, Forex…"
+                  />
+                </Field>
+              </div>
+
+              <Field label="Image (optional)">
+                <input
+                  type="file"
+                  accept="image/*"
+                  onChange={e => {
+                    const file = e.target.files?.[0];
+                    if (file) {
+                      const reader = new FileReader();
+                      reader.onload = () => setField('image', String(reader.result));
+                      reader.readAsDataURL(file);
+                    }
+                  }}
+                />
+                {draft.image && <img className="image-preview" src={draft.image} alt="Entry preview" />}
+              </Field>
+              <Field label="Summary">
+                <textarea
+                  value={draft.summary}
+                  onChange={e => setField('summary', e.target.value)}
+                  placeholder="The important takeaway in your own words…"
+                />
+              </Field>
+              <Field label="Personal notes">
+                <textarea
+                  value={draft.notes}
+                  onChange={e => setField('notes', e.target.value)}
+                  placeholder="Anything you want to remember or try… (use #hashtags to auto-tag)"
+                />
+              </Field>
+              <Field label="Tags">
+                <input
+                  value={draft.tags}
+                  onChange={e => setField('tags', e.target.value)}
+                  placeholder="python, beginner, youtube"
+                />
+              </Field>
+              <div className="repeat-head">
+                <h3>Dynamic sections</h3>
+                <button
+                  type="button"
+                  className="secondary small"
+                  onClick={() =>
+                    setDraft(old => ({ ...old, sections: [...old.sections, { heading: '', content: '' }] }))
                   }
-                }}
-              />
-              {draft.image && <img className="image-preview" src={draft.image} alt="Entry preview" />}
-            </Field>
-            <Field label="Summary">
-              <textarea
-                value={draft.summary}
-                onChange={e => setField('summary', e.target.value)}
-                placeholder="The important takeaway in your own words…"
-              />
-            </Field>
-            <Field label="Personal notes">
-              <textarea
-                value={draft.notes}
-                onChange={e => setField('notes', e.target.value)}
-                placeholder="Anything you want to remember or try… (use #hashtags to auto-tag)"
-              />
-            </Field>
-            <Field label="Tags">
-              <input
-                value={draft.tags}
-                onChange={e => setField('tags', e.target.value)}
-                placeholder="python, beginner, youtube"
-              />
-            </Field>
-            <div className="repeat-head">
-              <h3>Dynamic sections</h3>
-              <button
-                type="button"
-                className="secondary small"
-                onClick={() => setDraft(old => ({ ...old, sections: [...old.sections, { heading: '', content: '' }] }))}
-              >
-                + Add section
-              </button>
-            </div>
-            {draft.sections.map((section, index) => (
-              <div className="repeat-row" key={index}>
-                <input
-                  value={section.heading}
-                  onChange={e => updateSection(index, 'heading', e.target.value)}
-                  placeholder="Heading (e.g. Recommended channels)"
-                />
-                <input
-                  value={section.content}
-                  onChange={e => updateSection(index, 'content', e.target.value)}
-                  placeholder="Details"
-                />
-                {draft.sections.length > 1 && (
+                >
+                  + Add section
+                </button>
+              </div>
+              {draft.sections.map((section, index) => (
+                <div className="repeat-row" key={index}>
+                  <input
+                    value={section.heading}
+                    onChange={e => updateSection(index, 'heading', e.target.value)}
+                    placeholder="Heading (e.g. Recommended channels)"
+                  />
+                  <input
+                    value={section.content}
+                    onChange={e => updateSection(index, 'content', e.target.value)}
+                    placeholder="Details"
+                  />
+                  {draft.sections.length > 1 && (
+                    <button
+                      type="button"
+                      className="delete-row"
+                      onClick={() =>
+                        setDraft(old => ({ ...old, sections: old.sections.filter((_, i) => i !== index) }))
+                      }
+                    >
+                      ×
+                    </button>
+                  )}
+                </div>
+              ))}
+              <div className="repeat-head">
+                <h3>Resources</h3>
+                <button
+                  type="button"
+                  className="secondary small"
+                  onClick={() =>
+                    setDraft(old => ({ ...old, resources: [...old.resources, { name: '', url: '', kind: 'Website' }] }))
+                  }
+                >
+                  + Add resource
+                </button>
+              </div>
+              {draft.resources.map((resource, index) => (
+                <div className="repeat-row resource" key={index}>
+                  <select value={resource.kind} onChange={e => updateResource(index, 'kind', e.target.value)}>
+                    <option>Website</option>
+                    <option>YouTube</option>
+                    <option>GitHub</option>
+                    <option>Article</option>
+                    <option>Product</option>
+                  </select>
+                  <input
+                    value={resource.name}
+                    onChange={e => updateResource(index, 'name', e.target.value)}
+                    placeholder="Resource name"
+                  />
+                  <input
+                    type="url"
+                    value={resource.url}
+                    onChange={e => updateResource(index, 'url', e.target.value)}
+                    placeholder="https://…"
+                  />
                   <button
                     type="button"
                     className="delete-row"
-                    onClick={() => setDraft(old => ({ ...old, sections: old.sections.filter((_, i) => i !== index) }))}
+                    onClick={() =>
+                      setDraft(old => ({ ...old, resources: old.resources.filter((_, i) => i !== index) }))
+                    }
                   >
                     ×
                   </button>
-                )}
-              </div>
-            ))}
-            <div className="repeat-head">
-              <h3>Resources</h3>
-              <button
-                type="button"
-                className="secondary small"
-                onClick={() =>
-                  setDraft(old => ({ ...old, resources: [...old.resources, { name: '', url: '', kind: 'Website' }] }))
-                }
-              >
-                + Add resource
-              </button>
-            </div>
-            {draft.resources.map((resource, index) => (
-              <div className="repeat-row resource" key={index}>
-                <select value={resource.kind} onChange={e => updateResource(index, 'kind', e.target.value)}>
-                  <option>Website</option>
-                  <option>YouTube</option>
-                  <option>GitHub</option>
-                  <option>Article</option>
-                  <option>Product</option>
-                </select>
-                <input
-                  value={resource.name}
-                  onChange={e => updateResource(index, 'name', e.target.value)}
-                  placeholder="Resource name"
-                />
-                <input
-                  type="url"
-                  value={resource.url}
-                  onChange={e => updateResource(index, 'url', e.target.value)}
-                  placeholder="https://…"
-                />
-                <button
-                  type="button"
-                  className="delete-row"
-                  onClick={() => setDraft(old => ({ ...old, resources: old.resources.filter((_, i) => i !== index) }))}
-                >
-                  ×
+                </div>
+              ))}
+              <div className="modal-actions">
+                <button type="button" className="secondary" onClick={() => setModal(false)}>
+                  Cancel
+                </button>
+                <button className="primary" disabled={saving}>
+                  {saving ? 'Saving…' : editingId ? 'Save changes' : 'Save knowledge'}
                 </button>
               </div>
-            ))}
-            <div className="modal-actions">
-              <button type="button" className="secondary" onClick={() => setModal(false)}>
-                Cancel
-              </button>
-              <button className="primary" disabled={saving}>
-                {saving ? 'Saving…' : editingId ? 'Save changes' : 'Save knowledge'}
-              </button>
-            </div>
-          </form>
-        </div>
-      )}
-    </div>
+            </form>
+          </div>
+        )}
+      </div>
+    </>
   );
 }
 
